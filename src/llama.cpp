@@ -191,6 +191,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             std::vector<ggml_backend_dev_t> devs;
+            std::vector<ggml_backend_dev_t> devs_cpu; // NUMA nodes, used only when there is no other device
             devs.reserve(ggml_backend_dev_count());
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
@@ -198,7 +199,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
                     continue;
                 }
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    devs_cpu.push_back(dev);
+                    continue;
+                }
                 devs.push_back(dev);
+            }
+            if (devs.empty()) {
+                devs = devs_cpu;
             }
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);

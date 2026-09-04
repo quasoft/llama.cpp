@@ -35,6 +35,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/iqp.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
+        ggml-cpu/numa.cpp
+        ggml-cpu/numa.h
         ggml-cpu/quants.c
         ggml-cpu/quants.h
         ggml-cpu/traits.cpp
