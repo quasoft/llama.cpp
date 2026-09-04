@@ -82,7 +82,6 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 }
 
 static bool ggml_backend_cpu_device_is_numa(ggml_backend_dev_t dev);
-static int  ggml_backend_cpu_device_n_cpus (ggml_backend_dev_t dev);
 
 static ggml_backend_buffer_type_t * ggml_backend_cpu_device_get_extra_buffers_type(ggml_backend_dev_t device) {
     static std::vector<ggml_backend_buffer_type_t> extra_bufts = [] {
@@ -272,8 +271,7 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     if (ctx->numa) {
-        // the pinned threadpool has one thread per logical processor of the node
-        n_threads = std::min(n_threads, ggml_backend_cpu_device_n_cpus(backend_cpu->device));
+        return; // NUMA devices use all processors of their node or GGML_CPU_NUMA_N_THREADS, not the count of the default device
     }
     ctx->n_threads = n_threads;
 }
@@ -544,10 +542,6 @@ static bool ggml_backend_cpu_device_is_numa(ggml_backend_dev_t dev) {
     return ((const struct ggml_backend_cpu_device_context *)dev->context)->numa_node >= 0;
 }
 
-static int ggml_backend_cpu_device_n_cpus(ggml_backend_dev_t dev) {
-    return ((const struct ggml_backend_cpu_device_context *)dev->context)->n_cpus;
-}
-
 static const char * ggml_backend_cpu_numa_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     return ggml_backend_cpu_device_get_name(buft->device);
 }
@@ -790,7 +784,7 @@ static ggml_backend_t ggml_backend_cpu_numa_device_init_backend(ggml_backend_dev
     ctx->use_ref             = false;
     ctx->numa                = dev_ctx->worker;
 
-    // the Meta backend does not forward ggml_backend_set_n_threads to its devices
+    // ggml_backend_set_n_threads is not used for NUMA devices, the Meta backend does not forward it anyway
     const char * env = getenv("GGML_CPU_NUMA_N_THREADS");
     if (env != NULL) {
         ctx->n_threads = std::max(1, std::min(atoi(env), dev_ctx->n_cpus));
