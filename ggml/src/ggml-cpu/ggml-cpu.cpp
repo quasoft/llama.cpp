@@ -8,6 +8,7 @@
 #include "numa.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstdlib>
@@ -43,6 +44,10 @@
 #if defined(__APPLE__)
 #    include <sys/sysctl.h>
 #    include <sys/types.h>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#    include <immintrin.h>
 #endif
 
 // ggml-backend interface
@@ -271,7 +276,7 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     if (ctx->numa) {
-        return; // NUMA devices use all processors of their node or GGML_CPU_NUMA_N_THREADS, not the count of the default device
+        return; // NUMA devices use the thread count of their pinned pool, see ggml_backend_cpu_numa_worker
     }
     ctx->n_threads = n_threads;
 }
@@ -634,22 +639,40 @@ static const struct ggml_backend_buffer_type_i ggml_backend_cpu_numa_buffer_type
 // one driver thread and one pinned threadpool per device, shared by all backends (contexts) that use the device
 // one graph is in flight at a time, graph_compute waits for the previous graph and synchronize waits for the current one
 // the worker is never destroyed, joining its thread at process exit is not safe from a DLL
+static inline void ggml_backend_cpu_numa_relax(void) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
 struct ggml_backend_cpu_numa_worker {
     const struct ggml_backend_cpu_device_context * dev_ctx;
+
+    // size of the pinned pool: GGML_CPU_NUMA_N_THREADS, at most all processors of the node but one
+    // the free processor is for the thread that drives the backends, without it every hand-off waits for the scheduler
+    int n_threads;
 
     std::thread             thread;
     std::mutex              mutex;
     std::condition_variable cond;
     bool                    ready = false;
 
-    struct ggml_cgraph *              cgraph     = NULL; // graph being computed
-    struct ggml_backend_cpu_context * cgraph_ctx = NULL; // backend that submitted it
+    std::atomic<struct ggml_cgraph *> cgraph{nullptr};      // graph being computed
+    struct ggml_backend_cpu_context * cgraph_ctx = nullptr; // backend that submitted it
 
     ggml_threadpool_t threadpool = NULL;
     uint8_t *         work_data  = NULL;
     size_t            work_size  = 0;
 
     ggml_backend_cpu_numa_worker(const struct ggml_backend_cpu_device_context * dev_ctx) : dev_ctx(dev_ctx) {
+        n_threads = std::max(1, dev_ctx->n_cpus - 1);
+        const char * env = getenv("GGML_CPU_NUMA_N_THREADS");
+        if (env != NULL && atoi(env) > 0) {
+            n_threads = std::min(atoi(env), n_threads);
+        }
+
         thread = std::thread(&ggml_backend_cpu_numa_worker::run, this);
         thread.detach();
 
@@ -657,24 +680,46 @@ struct ggml_backend_cpu_numa_worker {
         cond.wait(lock, [this] { return ready; });
     }
 
+    bool busy() const {
+        return cgraph.load(std::memory_order_acquire) != nullptr;
+    }
+
+    // hand-offs inside a token are much shorter than a wake-up by the OS, so spin for a while before blocking
+    template <typename F> bool spin(F done) {
+        const int64_t t_start = ggml_time_us();
+        for (int i = 0; ; i++) {
+            if (done()) {
+                return true;
+            }
+            ggml_backend_cpu_numa_relax();
+            if ((i & 63) == 0 && ggml_time_us() - t_start > 10000) {
+                return false;
+            }
+        }
+    }
+
     void submit(struct ggml_backend_cpu_context * cpu_ctx, struct ggml_cgraph * graph) {
+        spin([this] { return !busy(); });
         {
             std::unique_lock<std::mutex> lock(mutex);
-            cond.wait(lock, [this] { return cgraph == NULL; });
-            cgraph     = graph;
+            cond.wait(lock, [this] { return !busy(); });
             cgraph_ctx = cpu_ctx;
+            cgraph.store(graph, std::memory_order_release);
         }
         cond.notify_all();
     }
 
     void wait() {
+        if (spin([this] { return !busy(); })) {
+            return;
+        }
         std::unique_lock<std::mutex> lock(mutex);
-        cond.wait(lock, [this] { return cgraph == NULL; });
+        cond.wait(lock, [this] { return !busy(); });
     }
 
     void run() {
         // the threadpool is created on this thread, so this thread is worker 0 and gets the affinity of the node
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(dev_ctx->n_cpus);
+        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
         memcpy(tpp.cpumask, dev_ctx->cpumask, sizeof(tpp.cpumask));
         threadpool = ggml_threadpool_new(&tpp);
 
@@ -684,21 +729,24 @@ struct ggml_backend_cpu_numa_worker {
         }
         cond.notify_all();
 
-        std::unique_lock<std::mutex> lock(mutex);
         while (true) {
-            cond.wait(lock, [this] { return cgraph != NULL; });
-            struct ggml_cgraph *              graph   = cgraph;
+            if (!spin([this] { return busy(); })) {
+                std::unique_lock<std::mutex> lock(mutex);
+                cond.wait(lock, [this] { return busy(); });
+            }
+            struct ggml_cgraph *              graph   = cgraph.load(std::memory_order_acquire);
             struct ggml_backend_cpu_context * cpu_ctx = cgraph_ctx;
-            lock.unlock();
 
             const enum ggml_status status = compute(cpu_ctx, graph);
             if (status != GGML_STATUS_SUCCESS && status != GGML_STATUS_ABORTED) {
                 GGML_LOG_ERROR("%s: %s graph compute failed with status %d\n", __func__, dev_ctx->name.c_str(), (int) status);
             }
 
-            lock.lock();
-            cgraph     = NULL;
-            cgraph_ctx = NULL;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                cgraph_ctx = nullptr;
+                cgraph.store(nullptr, std::memory_order_release);
+            }
             cond.notify_all();
         }
     }
@@ -775,7 +823,7 @@ static ggml_backend_t ggml_backend_cpu_numa_device_init_backend(ggml_backend_dev
     }
 
     struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
-    ctx->n_threads           = dev_ctx->n_cpus;
+    ctx->n_threads           = dev_ctx->worker->n_threads;
     ctx->threadpool          = dev_ctx->worker->threadpool;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
@@ -783,12 +831,6 @@ static ggml_backend_t ggml_backend_cpu_numa_device_init_backend(ggml_backend_dev
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
     ctx->numa                = dev_ctx->worker;
-
-    // ggml_backend_set_n_threads is not used for NUMA devices, the Meta backend does not forward it anyway
-    const char * env = getenv("GGML_CPU_NUMA_N_THREADS");
-    if (env != NULL) {
-        ctx->n_threads = std::max(1, std::min(atoi(env), dev_ctx->n_cpus));
-    }
 
     return new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
