@@ -1487,6 +1487,16 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
     }
+
+    // TODO: temporary debug for the NUMA / tensor-parallel set_rows crash - remove when diagnosed
+    // LLAMA_DEBUG_KV_IDXS=1 prints where the indices were written, to correlate with the set_rows dump
+    if (getenv("LLAMA_DEBUG_KV_IDXS")) {
+        LLAMA_LOG_INFO("%s: %-20s data = %p buf = %-20s n_tokens = %4u n_stream = %u size = %u idxs[0] = %lld idxs[n-1] = %lld\n",
+                __func__, dst->name, dst->data,
+                dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "(null)",
+                n_tokens, (unsigned) sinfo.n_stream(), (unsigned) get_size(),
+                (long long) data[0], (long long) data[n_tokens - 1]);
+    }
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {

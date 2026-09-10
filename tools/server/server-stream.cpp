@@ -461,6 +461,7 @@ server_http_context::handler_t server_stream_make_get_handler() {
         }
         auto session = g_stream_sessions.get(conv_id);
         if (!session) {
+            SRV_INF("GET /v1/stream conv_id=%s from=%s -> 404 not found\n", conv_id.c_str(), req.get_param("from").c_str());
             return make_error_response(404, "Stream not found or expired", ERROR_TYPE_NOT_FOUND);
         }
         size_t from = 0;
@@ -473,8 +474,10 @@ server_http_context::handler_t server_stream_make_get_handler() {
             }
         }
         if (from < session->dropped_prefix()) {
+            SRV_INF("GET /v1/stream conv_id=%s from=%zu -> 400 offset lost (dropped %zu)\n", conv_id.c_str(), from, session->dropped_prefix());
             return make_error_response(400, "Stream offset lost, please restart", ERROR_TYPE_INVALID_REQUEST);
         }
+        SRV_INF("GET /v1/stream conv_id=%s from=%zu -> 200 (buffered %zu, done %d)\n", conv_id.c_str(), from, session->total_size(), (int) session->is_done());
         auto res = std::make_unique<server_http_res>();
         res->status = 200;
         res->content_type = "text/event-stream";

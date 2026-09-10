@@ -51,6 +51,29 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
 // meta backend device
 //
 
+// TODO: temporary diagnostic (GGML_META_CHECK_IDX=1) for the NUMA tensor-parallel set_rows crash.
+// Mirrored integer inputs copied into a meta buffer (the KV cache row indices) are recorded; their per-device
+// copies are verified before every subgraph and after the graph, and at the start of each graph every
+// per-device node that runs before the last SET_ROWS reading an index buffer is checked for overlapping it.
+struct ggml_backend_meta_idx_check {
+    std::string          name;
+    std::vector<uint8_t> bytes;
+    const void *         data;
+    size_t               j;
+    bool                 reported;
+};
+static std::vector<ggml_backend_meta_idx_check> & ggml_backend_meta_idx_checks() {
+    static std::vector<ggml_backend_meta_idx_check> checks;
+    return checks;
+}
+static int ggml_backend_meta_idx_check_level() {
+    static const int level = getenv("GGML_META_CHECK_IDX") ? std::max(1, atoi(getenv("GGML_META_CHECK_IDX"))) : 0;
+    return level;
+}
+static bool ggml_backend_meta_idx_check_enabled() {
+    return ggml_backend_meta_idx_check_level() > 0;
+}
+
 struct ggml_backend_meta_device_context {
     std::vector<ggml_backend_dev_t>     simple_devs;
     ggml_backend_meta_get_split_state_t get_split_state;
@@ -540,6 +563,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            char buf[4096];
+            int off = snprintf(buf, sizeof(buf),
+                "meta per-row op with axis-0 split: %s (%s) ne = [%lld %lld %lld %lld]\n",
+                tensor->name, ggml_op_name(tensor->op),
+                (long long) tensor->ne[0], (long long) tensor->ne[1],
+                (long long) tensor->ne[2], (long long) tensor->ne[3]);
+            for (size_t k = 0; k < GGML_MAX_SRC && off > 0 && off < (int) sizeof(buf); k++) {
+                if (tensor->src[k] == nullptr) {
+                    continue;
+                }
+                off += snprintf(buf + off, sizeof(buf) - off,
+                    "    src[%zu] = %-30s (%-14s) axis %2d ne = [%lld %lld %lld %lld] segs %u nr %u ne_dev = [%lld %lld]\n",
+                    k, tensor->src[k]->name, ggml_op_name(tensor->src[k]->op), (int) src_ss[k].axis,
+                    (long long) tensor->src[k]->ne[0], (long long) tensor->src[k]->ne[1],
+                    (long long) tensor->src[k]->ne[2], (long long) tensor->src[k]->ne[3],
+                    (unsigned) src_ss[k].n_segments, (unsigned) src_ss[k].nr[0],
+                    (long long) src_ss[k].ne[0], (long long) src_ss[k].ne[1]);
+            }
+            GGML_LOG_ERROR("%s", buf);
+        }
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
         return src_ss[0];
     };
@@ -1095,6 +1139,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         for (size_t s = 0; s < src_ss[i].n_segments; s++) {
                             sum += src_ss[i].ne[s*n_bufs + j] * src_ss[i].nr[s];
                         }
+                        if (split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
+                                                                 != sum * tensor->ne[split_state.axis]) {
+                            char buf[4096];
+                            int off = snprintf(buf, sizeof(buf),
+                                "meta split ratio mismatch: %s (%s) axis %d ne = [%lld %lld %lld %lld] | j = %zu i = %zu sum = %lld ne[j] = %lld nr = %u\n",
+                                tensor->name, ggml_op_name(tensor->op), (int) split_state.axis,
+                                (long long) tensor->ne[0], (long long) tensor->ne[1],
+                                (long long) tensor->ne[2], (long long) tensor->ne[3],
+                                j, i, (long long) sum, (long long) split_state.ne[j], (unsigned) split_state.nr[0]);
+                            for (size_t k = 0; k < GGML_MAX_SRC && off > 0 && off < (int) sizeof(buf); k++) {
+                                if (tensor->src[k] == nullptr) {
+                                    continue;
+                                }
+                                off += snprintf(buf + off, sizeof(buf) - off,
+                                    "    src[%zu] = %-30s (%-14s) axis %2d ne = [%lld %lld %lld %lld] segs %u nr %u ne_dev = [%lld %lld]\n",
+                                    k, tensor->src[k]->name, ggml_op_name(tensor->src[k]->op), (int) src_ss[k].axis,
+                                    (long long) tensor->src[k]->ne[0], (long long) tensor->src[k]->ne[1],
+                                    (long long) tensor->src[k]->ne[2], (long long) tensor->src[k]->ne[3],
+                                    (unsigned) src_ss[k].n_segments, (unsigned) src_ss[k].nr[0],
+                                    (long long) src_ss[k].ne[0], n_bufs > 1 ? (long long) src_ss[k].ne[1] : -1LL);
+                            }
+                            GGML_LOG_ERROR("%s", buf);
+                        }
                         GGML_ASSERT(split_state.ne[j]*split_state.nr[0] * tensor->src[i]->ne[src_ss[i].axis]
                                                                  == sum * tensor->ne[split_state.axis]);
                     }
@@ -1506,6 +1573,14 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
+            }
+            if (ggml_backend_meta_idx_check_enabled() && offset == 0 && size <= 65536 &&
+                    (tensor->type == GGML_TYPE_I64 || tensor->type == GGML_TYPE_I32)) {
+                for (size_t j = 0; j < n_bufs; j++) {
+                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    ggml_backend_meta_idx_checks().push_back({tensor->name,
+                        std::vector<uint8_t>((const uint8_t *) data, (const uint8_t *) data + size), simple_tensor->data, j, false});
+                }
             }
         } break;
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
@@ -2431,12 +2506,176 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+    // TODO: temporary diagnostic, see ggml_backend_meta_idx_check
+    auto check_idx = [&](const char * where, size_t i_sub) {
+        auto & checks = ggml_backend_meta_idx_checks();
+        if (!ggml_backend_meta_idx_check_enabled() || checks.empty()) {
+            return;
+        }
+        static int n_reports = 0;
+        auto overlaps = [](const ggml_tensor * t, const void * data, size_t size) {
+            const char * a0 = (const char *) t->data;
+            const char * a1 = a0 + ggml_nbytes(t);
+            const char * b0 = (const char *) data;
+            const char * b1 = b0 + size;
+            return a0 < b1 && b0 < a1;
+        };
+        if (i_sub == 0) {
+            // static placement check: a node computed before the last SET_ROWS that reads an index buffer must not overlap it
+            for (auto & e : checks) {
+                auto & bcj = backend_ctx->backend_configs[e.j];
+                int last_reader = -1;
+                for (int n = 0; n < cgraph->n_nodes; n++) {
+                    ggml_tensor * t = bcj.nodes[n];
+                    if (t != nullptr && t->op == GGML_OP_SET_ROWS && t->src[1] != nullptr && t->src[1]->data == e.data) {
+                        last_reader = n;
+                    }
+                }
+                for (int n = 0; n < last_reader; n++) {
+                    ggml_tensor * t = bcj.nodes[n];
+                    if (t == nullptr || t->data == nullptr || ggml_nbytes(t) == 0 || !overlaps(t, e.data, e.bytes.size())) {
+                        continue;
+                    }
+                    if (n_reports++ < 40) {
+                        GGML_LOG_ERROR("idx check: PLACEMENT node[%d] %s (%s)%s data = %p nbytes = %zu overlaps index buffer %s (device %zu, %p + %zu) still read by node[%d]\n",
+                            n, t->name, ggml_op_name(t->op), t->view_src ? " (view)" : "", t->data, ggml_nbytes(t),
+                            e.name.c_str(), e.j, e.data, e.bytes.size(), last_reader);
+                    }
+                }
+            }
+        }
         for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+        for (auto & e : checks) {
+            if (e.reported || memcmp(e.data, e.bytes.data(), e.bytes.size()) == 0) {
+                continue;
+            }
+            e.reported = true;
+            if (n_reports++ >= 40) {
+                continue;
+            }
+            auto & bcj = backend_ctx->backend_configs[e.j];
+            bool still_needed = false;
+            for (size_t k = i_sub; k < backend_ctx->n_subgraphs && !still_needed; k++) {
+                ggml_cgraph * g = bcj.cgraphs[k].cgraph_main;
+                for (int n = 0; n < g->n_nodes; n++) {
+                    ggml_tensor * t = g->nodes[n];
+                    if (t->op == GGML_OP_SET_ROWS && t->src[1] != nullptr && t->src[1]->data == e.data) {
+                        still_needed = true;
+                        break;
+                    }
+                }
+            }
+            if (!still_needed) {
+                continue; // memory reuse after the last SET_ROWS that reads the buffer: expected, stay quiet
+            }
+            GGML_LOG_ERROR("idx check: %s on device %zu changed %s %zu of %zu, data = %p size = %zu: %s\n",
+                e.name.c_str(), e.j, where, i_sub, (size_t) backend_ctx->n_subgraphs, e.data, e.bytes.size(),
+                still_needed ? "STILL READ BY A LATER SET_ROWS - real corruption" : "no longer read - memory reuse, benign");
+            for (size_t k = 0; k + 8 <= e.bytes.size(); k += 8) {
+                int64_t a, b;
+                memcpy(&a, e.bytes.data() + k, 8);
+                memcpy(&b, (const char *) e.data + k, 8);
+                if (a != b) {
+                    GGML_LOG_ERROR("    first difference at [%zu]: expected %lld, found %lld\n", k/8, (long long) a, (long long) b);
+                    break;
+                }
+            }
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                ggml_tensor * t = bcj.nodes[n];
+                if (t == nullptr || t->data == nullptr || ggml_nbytes(t) == 0 || !overlaps(t, e.data, e.bytes.size())) {
+                    continue;
+                }
+                GGML_LOG_ERROR("    overlapping node[%d] %s (%s)%s data = %p nbytes = %zu\n",
+                    n, t->name, ggml_op_name(t->op), t->view_src ? " (view)" : "", t->data, ggml_nbytes(t));
+            }
+        }
+    };
+
+    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        check_idx("before subgraph", i);
+        if (ggml_backend_meta_idx_check_level() >= 2 && !ggml_backend_meta_idx_checks().empty()) {
+            // TODO: temporary diagnostic level 2 (GGML_META_CHECK_IDX=2): run the subgraph node by node on every
+            // device and verify the recorded index buffers after each node, so the writer is named exactly.
+            // A one-node graph on the stack is safe because the NUMA backend copies the graph before returning.
+            int n_max = 0;
+            for (size_t j = 0; j < n_backends; j++) {
+                n_max = std::max(n_max, backend_ctx->backend_configs[j].cgraphs[i].cgraph_main->n_nodes);
+            }
+            std::vector<ggml_tensor *> step_nodes(n_backends, nullptr);
+            std::vector<ggml_cgraph>   steps(n_backends);
+            for (int n = 0; n < n_max; n++) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * g = bcj.cgraphs[i].cgraph_main;
+                    step_nodes[j] = nullptr;
+                    if (n >= g->n_nodes) {
+                        continue;
+                    }
+                    step_nodes[j]    = g->nodes[n];
+                    steps[j]         = *g;
+                    steps[j].n_nodes = 1;
+                    steps[j].nodes   = &step_nodes[j];
+                    steps[j].n_leafs = 0;
+                    steps[j].leafs   = nullptr;
+                    const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, &steps[j]);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+                }
+                for (auto & e : ggml_backend_meta_idx_checks()) {
+                    if (e.reported || memcmp(e.data, e.bytes.data(), e.bytes.size()) == 0) {
+                        continue;
+                    }
+                    e.reported = true;
+                    GGML_LOG_ERROR("idx check: %s on device %zu changed after node %d of subgraph %zu (data = %p size = %zu)\n",
+                        e.name.c_str(), e.j, n, i, e.data, e.bytes.size());
+                    for (size_t k = 0; k + 8 <= e.bytes.size(); k += 8) {
+                        int64_t a, b;
+                        memcpy(&a, e.bytes.data() + k, 8);
+                        memcpy(&b, (const char *) e.data + k, 8);
+                        if (a != b) {
+                            GGML_LOG_ERROR("    first difference at [%zu]: expected %lld, found %lld\n", k/8, (long long) a, (long long) b);
+                            break;
+                        }
+                    }
+                    for (size_t j = 0; j < n_backends; j++) {
+                        ggml_tensor * t = step_nodes[j];
+                        if (t == nullptr) {
+                            continue;
+                        }
+                        const char * a0 = (const char *) t->data;
+                        const char * a1 = a0 + ggml_nbytes(t);
+                        const char * b0 = (const char *) e.data;
+                        const bool   ov = a0 < b0 + e.bytes.size() && b0 < a1;
+                        GGML_LOG_ERROR("    device %zu node: %s (%s)%s data = %p nbytes = %zu ne = [%lld %lld %lld %lld] nb = [%zu %zu %zu %zu]%s\n",
+                            j, t->name, ggml_op_name(t->op), t->view_src ? " (view)" : "", t->data, ggml_nbytes(t),
+                            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                            t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+                            ov ? "  <- declared range OVERLAPS the index buffer" : "  <- declared range does NOT cover the index buffer: overrun");
+                        for (int s = 0; s < GGML_MAX_SRC; s++) {
+                            const ggml_tensor * u = t->src[s];
+                            if (u == nullptr) {
+                                continue;
+                            }
+                            GGML_LOG_ERROR("        src[%d] = %s (%s) data = %p nbytes = %zu ne = [%lld %lld %lld %lld]\n",
+                                s, u->name, ggml_op_name(u->op), u->data, ggml_nbytes(u),
+                                (long long) u->ne[0], (long long) u->ne[1], (long long) u->ne[2], (long long) u->ne[3]);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
             }
         }
 
@@ -2461,6 +2700,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+    check_idx("after subgraph", backend_ctx->n_subgraphs);
+    ggml_backend_meta_idx_checks().clear();
+
     return GGML_STATUS_SUCCESS;
 }
 

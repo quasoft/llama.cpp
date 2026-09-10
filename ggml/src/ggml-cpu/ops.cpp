@@ -5,6 +5,7 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "unary-ops.h"
 #include "vec.h"
 
@@ -5260,6 +5261,38 @@ static void ggml_compute_forward_set_rows_impl(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+                // TODO: temporary debug for the NUMA / tensor-parallel set_rows crash - remove when diagnosed
+                if (i1 < 0 || i1 >= ne1) {
+                    GGML_LOG_ERROR("%s: bad row index %lld (ne1 = %lld)\n"
+                                   "  dst  = %-24s [%6lld %6lld %6lld %6lld]\n"
+                                   "  src0 = %-24s [%6lld %6lld %6lld %6lld]\n"
+                                   "  src1 = %-24s [%6lld %6lld %6lld %6lld] type = %s\n"
+                                   "  i10 = %lld, i11 = %lld, i12 = %lld, ith = %d/%d\n",
+                                   __func__, (long long) i1, (long long) ne1,
+                                   dst->name,  (long long) ne0,  (long long) ne1,  (long long) ne2,  (long long) ne3,
+                                   src0->name, (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03,
+                                   src1->name, (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                                   ggml_type_name(src1->type),
+                                   (long long) i10, (long long) i11, (long long) i12, ith, nth);
+                    GGML_LOG_ERROR("  src1 buf = %-20s base = %p size = %10zu data = %p (offs %td)\n",
+                                   src1->buffer ? ggml_backend_buffer_name(src1->buffer) : "(null)",
+                                   src1->buffer ? ggml_backend_buffer_get_base(src1->buffer) : NULL,
+                                   src1->buffer ? ggml_backend_buffer_get_size(src1->buffer) : (size_t) 0,
+                                   src1->data,
+                                   src1->buffer ? (char *) src1->data - (char *) ggml_backend_buffer_get_base(src1->buffer) : (ptrdiff_t) 0);
+                    GGML_LOG_ERROR("  dst  buf = %-20s base = %p size = %10zu data = %p (offs %td)\n",
+                                   dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "(null)",
+                                   dst->buffer ? ggml_backend_buffer_get_base(dst->buffer) : NULL,
+                                   dst->buffer ? ggml_backend_buffer_get_size(dst->buffer) : (size_t) 0,
+                                   dst->data,
+                                   dst->buffer ? (char *) dst->data - (char *) ggml_backend_buffer_get_base(dst->buffer) : (ptrdiff_t) 0);
+                    // all values garbage => the index buffer was reused/raced by another graph
+                    // one value slightly too large => the indices themselves are wrong
+                    for (int64_t k = 0; k < std::min<int64_t>(ne10, 128); k++) {
+                        const int64_t v = *(idx_t *) ((char *) src1->data + k*nb10 + i11*nb11 + i12*nb12);
+                        GGML_LOG_ERROR("  idx[%3lld] = %lld\n", (long long) k, (long long) v);
+                    }
+                }
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                 if constexpr (std::is_same_v<src_t, float>) {
