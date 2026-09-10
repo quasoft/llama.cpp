@@ -275,6 +275,16 @@ llama_context::llama_context(
     // initialized later
     cparams.pipeline_parallel = false;
 
+    // with tensor parallelism the Meta backend keeps its per-device tensor structs in two rotating containers
+    // per buffer and resets the unused one on every graph_compute. Two contexts that share a buffer (an MTP
+    // draft context sharing KV-cache layers with its target) reset each other's live container, so a graph
+    // reused without re-allocation executes stale per-device nodes. Re-allocate every step instead: the Meta
+    // backend then always rebuilds from tensors created in this step.
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        graph_reuse_disable = true;
+        LLAMA_LOG_INFO("%s: graph reuse disabled for tensor parallelism\n", __func__);
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
