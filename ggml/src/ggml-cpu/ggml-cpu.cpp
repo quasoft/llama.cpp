@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef GGML_USE_CPU_HBM
@@ -647,6 +648,52 @@ static inline void ggml_backend_cpu_numa_relax(void) {
 #endif
 }
 
+// a graph handed to the worker is read on the worker thread while it executes, but callers are allowed to
+// rewrite the graph and its node structs as soon as graph_compute returns: the Meta backend rebuilds its
+// per-device graphs and all-reduce aux nodes in place on every call and ggml_backend_sched re-splits.
+// every other backend consumes the structs synchronously on the calling thread, so keep that contract by
+// computing from a private copy of the nodes. sources and view sources that are nodes of the same graph
+// are redirected to the copies, everything else (leafs, weights, the Meta backend's per-device tensors)
+// is not rewritten while a graph is in flight.
+struct ggml_backend_cpu_numa_graph_copy {
+    std::vector<struct ggml_tensor>   nodes;
+    std::vector<struct ggml_tensor *> node_ptrs;
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> remap;
+    struct ggml_cgraph                graph = {};
+
+    void capture(const struct ggml_cgraph * src) {
+        const int n = src->n_nodes;
+        nodes.resize(n);
+        node_ptrs.resize(n);
+        remap.clear();
+        for (int i = 0; i < n; i++) {
+            nodes[i]             = *src->nodes[i];
+            node_ptrs[i]         = &nodes[i];
+            remap[src->nodes[i]] = &nodes[i];
+        }
+        for (int i = 0; i < n; i++) {
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (nodes[i].src[s] != nullptr) {
+                    auto it = remap.find(nodes[i].src[s]);
+                    if (it != remap.end()) {
+                        nodes[i].src[s] = it->second;
+                    }
+                }
+            }
+            if (nodes[i].view_src != nullptr) {
+                auto it = remap.find(nodes[i].view_src);
+                if (it != remap.end()) {
+                    nodes[i].view_src = it->second;
+                }
+            }
+        }
+        graph         = *src;
+        graph.nodes   = node_ptrs.data();
+        graph.leafs   = nullptr;
+        graph.n_leafs = 0;
+    }
+};
+
 struct ggml_backend_cpu_numa_worker {
     const struct ggml_backend_cpu_device_context * dev_ctx;
 
@@ -660,6 +707,8 @@ struct ggml_backend_cpu_numa_worker {
     bool                    ready = false;
 
     std::atomic<struct ggml_cgraph *> cgraph{nullptr};      // graph being computed
+    struct ggml_backend_cpu_numa_graph_copy graphs[2]; // graphs[graph_cur] is being computed, submit fills the other one
+    int graph_cur = 0;
     struct ggml_backend_cpu_context * cgraph_ctx = nullptr; // backend that submitted it
 
     ggml_threadpool_t threadpool = NULL;
@@ -699,12 +748,17 @@ struct ggml_backend_cpu_numa_worker {
     }
 
     void submit(struct ggml_backend_cpu_context * cpu_ctx, struct ggml_cgraph * graph) {
+        // copy while the previous graph is still computing, see ggml_backend_cpu_numa_graph_copy
+        struct ggml_backend_cpu_numa_graph_copy & copy = graphs[graph_cur ^ 1];
+        copy.capture(graph);
+
         spin([this] { return !busy(); });
         {
             std::unique_lock<std::mutex> lock(mutex);
             cond.wait(lock, [this] { return !busy(); });
+            graph_cur ^= 1;
             cgraph_ctx = cpu_ctx;
-            cgraph.store(graph, std::memory_order_release);
+            cgraph.store(&copy.graph, std::memory_order_release);
         }
         cond.notify_all();
     }
