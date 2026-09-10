@@ -504,6 +504,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // standard attention
+        // A layer with fewer KV heads than devices (MQA, n_head_kv == 1) cannot have its KV side divided.
+        // The generic assignment then rounds every device but one down to zero, so the whole KV side lands
+        // on a single device while Q is placed on another. That produces two failures downstream:
+        //   - FLASH_ATTN_EXT sees Q and K/V on opposite devices (split ratio mismatch assert)
+        //   - per-row ops (Gemma's K-norm) see a degenerate axis-0 split of a single head
+        // Mirror the KV side instead; handle_flash_attn_ext already supports mirrored K/V with split Q.
+        if (std::regex_match(tensor_name, pattern_kv_weight) || std::regex_match(tensor_name, pattern_kv_bias) ||
+                std::regex_match(tensor_name, pattern_kv_cache)) {
+            const tensor_config tc_probe = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (hparams.n_head_kv(tc_probe.il) < ud->n_devices) {
+                return tc_probe;
+            }
+        }
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
